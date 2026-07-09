@@ -1,0 +1,561 @@
+#include "asr.h"
+extern "C"{ void * __dso_handle = 0 ;}
+#include "setup.h"
+#include "HardwareSerial.h"
+#include "myLib/asr_event.h"
+
+uint32_t snid;
+void UART0_RX();
+void ASR_CODE();
+void app();
+
+// ==================== 全局开关 ====================
+// false：关闭坐姿检测播报，不响应 K1 发来的坐姿 AA 01~07 55
+// true ：打开坐姿检测播报，正常响应 K1 坐姿指令
+volatile bool posture_detect_enable = false;
+
+// ==================== 学习计时器 ====================
+// false：当前没有学习计时
+// true ：正在学习计时
+volatile bool study_timer_running = false;
+uint32_t study_start_ms = 0;
+
+
+// ==================== 协议定义 ====================
+// K1 -> ASRPRO：
+//   AA 01~07 55 [0D 0A]                 坐姿播报
+//   AA 20 温度整数 湿度整数 55 [0D 0A]  温湿度播报
+//   AA 21 55 [0D 0A]                    温湿度读取失败
+// ASRPRO -> K1：
+//   AB 20 55                            请求 K1 读取 face 板温湿度
+static const uint8_t CMD_ENV_REPORT = 0x20;
+static const uint8_t CMD_ENV_FAIL   = 0x21;
+
+// ==================== 1. 天问语音宏配置区 ====================
+//{speak:小蝶-清新女声,vol:10,speed:10,platform:haohaodada}
+//{playid:10001,voice:欢迎使用坐姿监测助手。}
+//{playid:10002,voice:我退下了，使用小助手唤醒我}
+
+// --- 坐姿恢复：0x01 ---
+//{playid:10501,voice:坐姿恢复良好，请继续保持。}
+//{playid:10506,voice:很好，已经坐正了，继续保持这个状态。}
+//{playid:10507,voice:坐姿看起来不错，保持放松和挺拔。}
+
+// --- 轻度驼背：0x02 ---
+//{playid:10502,voice:请端正坐姿，不要驼背。}
+//{playid:10508,voice:小提醒，背部有点弯，请轻轻坐直。}
+//{playid:10509,voice:注意一下背部姿态，把肩背慢慢打开。}
+
+// --- 轻度高低肩：0x03 ---
+//{playid:10503,voice:请注意，您当前有高低肩风险。}
+//{playid:10513,voice:双肩有些不平，试着放松肩膀。}
+//{playid:10514,voice:肩膀左右高度不太一致，请调整一下坐姿。}
+
+// --- 明显驼背：0x04 ---
+//{playid:10510,voice:检测到明显驼背，请把背挺直一点。}
+//{playid:10511,voice:当前前倾比较明显，请坐回椅背，放松颈肩。}
+//{playid:10512,voice:背部弯曲较明显，建议抬头挺胸，休息一下眼睛。}
+
+// --- 明显高低肩：0x05 ---
+//{playid:10515,voice:高低肩比较明显，请调整双肩高度。}
+//{playid:10516,voice:请把两侧肩膀放平，避免长时间单侧用力。}
+//{playid:10517,voice:肩部倾斜较明显，建议坐正并放松双肩。}
+
+// --- 背部和肩膀同时异常：0x06 ---
+//{playid:10518,voice:坐姿有些偏离，背部和肩膀都需要调整。}
+//{playid:10519,voice:请同时注意背部和双肩，慢慢坐正。}
+//{playid:10520,voice:当前坐姿不太稳定，建议重新调整一下身体位置。}
+
+// --- 画面无人，可选：0x07 ---
+//{playid:10521,voice:没有检测到您，请坐回摄像头前。}
+//{playid:10522,voice:我暂时看不到坐姿，请回到监测区域。}
+
+// --- 语音控制开关 ---
+//{playid:10504,voice:已打开坐姿检测。}
+//{playid:10505,voice:已关闭坐姿检测。}
+//{playid:10523,voice:坐姿检测当前处于打开状态。}
+//{playid:10524,voice:坐姿检测当前处于关闭状态。}
+
+// --- 环境温湿度播报 ---
+//{playid:10600,voice:当前环境状态如下，温度}
+//{playid:10601,voice:摄氏度，湿度}
+//{playid:10602,voice:百分之。}
+//{playid:10603,voice:暂时没有读取到温湿度数据。}
+//{playid:10604,voice:正在获取环境状态。}
+
+// --- 学习计时播报 ---
+//{playid:10610,voice:已开始学习。}
+//{playid:10611,voice:您已经学习了}
+//{playid:10612,voice:学习已结束，本次学习时间}
+//{playid:10613,voice:分钟}
+//{playid:10614,voice:秒}
+//{playid:10615,voice:当前还没有开始学习。}
+//{playid:10616,voice:小时}
+//{playid:10617,voice:学习计时已经在进行中。}
+
+// --- 0 到 99 数字播报片段，用于温度、湿度和学习时长组合播报 ---
+//{playid:10700,voice:零}
+//{playid:10701,voice:一}
+//{playid:10702,voice:二}
+//{playid:10703,voice:三}
+//{playid:10704,voice:四}
+//{playid:10705,voice:五}
+//{playid:10706,voice:六}
+//{playid:10707,voice:七}
+//{playid:10708,voice:八}
+//{playid:10709,voice:九}
+//{playid:10710,voice:十}
+//{playid:10711,voice:十一}
+//{playid:10712,voice:十二}
+//{playid:10713,voice:十三}
+//{playid:10714,voice:十四}
+//{playid:10715,voice:十五}
+//{playid:10716,voice:十六}
+//{playid:10717,voice:十七}
+//{playid:10718,voice:十八}
+//{playid:10719,voice:十九}
+//{playid:10720,voice:二十}
+//{playid:10721,voice:二十一}
+//{playid:10722,voice:二十二}
+//{playid:10723,voice:二十三}
+//{playid:10724,voice:二十四}
+//{playid:10725,voice:二十五}
+//{playid:10726,voice:二十六}
+//{playid:10727,voice:二十七}
+//{playid:10728,voice:二十八}
+//{playid:10729,voice:二十九}
+//{playid:10730,voice:三十}
+//{playid:10731,voice:三十一}
+//{playid:10732,voice:三十二}
+//{playid:10733,voice:三十三}
+//{playid:10734,voice:三十四}
+//{playid:10735,voice:三十五}
+//{playid:10736,voice:三十六}
+//{playid:10737,voice:三十七}
+//{playid:10738,voice:三十八}
+//{playid:10739,voice:三十九}
+//{playid:10740,voice:四十}
+//{playid:10741,voice:四十一}
+//{playid:10742,voice:四十二}
+//{playid:10743,voice:四十三}
+//{playid:10744,voice:四十四}
+//{playid:10745,voice:四十五}
+//{playid:10746,voice:四十六}
+//{playid:10747,voice:四十七}
+//{playid:10748,voice:四十八}
+//{playid:10749,voice:四十九}
+//{playid:10750,voice:五十}
+//{playid:10751,voice:五十一}
+//{playid:10752,voice:五十二}
+//{playid:10753,voice:五十三}
+//{playid:10754,voice:五十四}
+//{playid:10755,voice:五十五}
+//{playid:10756,voice:五十六}
+//{playid:10757,voice:五十七}
+//{playid:10758,voice:五十八}
+//{playid:10759,voice:五十九}
+//{playid:10760,voice:六十}
+//{playid:10761,voice:六十一}
+//{playid:10762,voice:六十二}
+//{playid:10763,voice:六十三}
+//{playid:10764,voice:六十四}
+//{playid:10765,voice:六十五}
+//{playid:10766,voice:六十六}
+//{playid:10767,voice:六十七}
+//{playid:10768,voice:六十八}
+//{playid:10769,voice:六十九}
+//{playid:10770,voice:七十}
+//{playid:10771,voice:七十一}
+//{playid:10772,voice:七十二}
+//{playid:10773,voice:七十三}
+//{playid:10774,voice:七十四}
+//{playid:10775,voice:七十五}
+//{playid:10776,voice:七十六}
+//{playid:10777,voice:七十七}
+//{playid:10778,voice:七十八}
+//{playid:10779,voice:七十九}
+//{playid:10780,voice:八十}
+//{playid:10781,voice:八十一}
+//{playid:10782,voice:八十二}
+//{playid:10783,voice:八十三}
+//{playid:10784,voice:八十四}
+//{playid:10785,voice:八十五}
+//{playid:10786,voice:八十六}
+//{playid:10787,voice:八十七}
+//{playid:10788,voice:八十八}
+//{playid:10789,voice:八十九}
+//{playid:10790,voice:九十}
+//{playid:10791,voice:九十一}
+//{playid:10792,voice:九十二}
+//{playid:10793,voice:九十三}
+//{playid:10794,voice:九十四}
+//{playid:10795,voice:九十五}
+//{playid:10796,voice:九十六}
+//{playid:10797,voice:九十七}
+//{playid:10798,voice:九十八}
+//{playid:10799,voice:九十九}
+
+// ==================== 2. 扩展语音话术轮播 ====================
+void play_good_variant() {
+  static uint8_t idx = 0;
+  if (idx == 0) play_audio(10501);
+  else if (idx == 1) play_audio(10506);
+  else play_audio(10507);
+  idx = (idx + 1) % 3;
+}
+
+void play_slouch_mild_variant() {
+  static uint8_t idx = 0;
+  if (idx == 0) play_audio(10502);
+  else if (idx == 1) play_audio(10508);
+  else play_audio(10509);
+  idx = (idx + 1) % 3;
+}
+
+void play_shoulder_mild_variant() {
+  static uint8_t idx = 0;
+  if (idx == 0) play_audio(10503);
+  else if (idx == 1) play_audio(10513);
+  else play_audio(10514);
+  idx = (idx + 1) % 3;
+}
+
+void play_slouch_severe_variant() {
+  static uint8_t idx = 0;
+  if (idx == 0) play_audio(10510);
+  else if (idx == 1) play_audio(10511);
+  else play_audio(10512);
+  idx = (idx + 1) % 3;
+}
+
+void play_shoulder_severe_variant() {
+  static uint8_t idx = 0;
+  if (idx == 0) play_audio(10515);
+  else if (idx == 1) play_audio(10516);
+  else play_audio(10517);
+  idx = (idx + 1) % 3;
+}
+
+void play_both_bad_variant() {
+  static uint8_t idx = 0;
+  if (idx == 0) play_audio(10518);
+  else if (idx == 1) play_audio(10519);
+  else play_audio(10520);
+  idx = (idx + 1) % 3;
+}
+
+void play_person_lost_variant() {
+  static uint8_t idx = 0;
+  if (idx == 0) play_audio(10521);
+  else play_audio(10522);
+  idx = (idx + 1) % 2;
+}
+
+void play_number_0_99(uint8_t n) {
+  if (n > 99) n = 99;
+  play_audio(10700 + n);
+}
+
+void play_env_report(uint8_t temp, uint8_t hum) {
+  if (temp > 99) temp = 99;
+  if (hum > 99) hum = 99;
+
+  play_audio(10600);      // 当前环境状态如下，温度
+  delay(180);
+  play_number_0_99(temp); // 数字
+  delay(180);
+  play_audio(10601);      // 摄氏度，湿度
+  delay(180);
+  play_number_0_99(hum);  // 数字
+  delay(180);
+  play_audio(10602);      // 百分之
+}
+
+void play_env_fail() {
+  play_audio(10603);
+}
+
+uint32_t get_study_elapsed_seconds() {
+  if (!study_timer_running) return 0;
+
+  uint32_t now_ms = millis();
+  // uint32_t 自然溢出相减仍可得到正确差值。
+  uint32_t elapsed_ms = now_ms - study_start_ms;
+  return elapsed_ms / 1000;
+}
+
+void play_duration_seconds(uint32_t total_seconds) {
+  uint32_t hours = total_seconds / 3600;
+  uint32_t minutes = (total_seconds % 3600) / 60;
+  uint32_t seconds = total_seconds % 60;
+
+  if (hours > 0) {
+    if (hours > 99) hours = 99;
+    play_number_0_99((uint8_t)hours);
+    delay(180);
+    play_audio(10616);      // 小时
+    delay(180);
+
+    if (minutes > 0) {
+      play_number_0_99((uint8_t)minutes);
+      delay(180);
+      play_audio(10613);    // 分钟
+      delay(180);
+    }
+
+    if (seconds > 0) {
+      play_number_0_99((uint8_t)seconds);
+      delay(180);
+      play_audio(10614);    // 秒
+    }
+    return;
+  }
+
+  if (minutes > 0) {
+    if (minutes > 99) minutes = 99;
+    play_number_0_99((uint8_t)minutes);
+    delay(180);
+    play_audio(10613);      // 分钟
+    delay(180);
+
+    if (seconds > 0) {
+      play_number_0_99((uint8_t)seconds);
+      delay(180);
+      play_audio(10614);    // 秒
+    }
+    return;
+  }
+
+  // 小于 1 分钟时，直接播报秒数。
+  play_number_0_99((uint8_t)seconds);
+  delay(180);
+  play_audio(10614);        // 秒
+}
+
+void start_study_timer() {
+  if (study_timer_running) {
+    play_audio(10617);      // 学习计时已经在进行中
+    delay(200);
+    play_audio(10611);      // 您已经学习了
+    delay(180);
+    play_duration_seconds(get_study_elapsed_seconds());
+    return;
+  }
+
+  study_timer_running = true;
+  study_start_ms = millis();
+  play_audio(10610);        // 已开始学习
+}
+
+void report_study_time() {
+  if (!study_timer_running) {
+    play_audio(10615);      // 当前还没有开始学习
+    return;
+  }
+
+  play_audio(10611);        // 您已经学习了
+  delay(180);
+  play_duration_seconds(get_study_elapsed_seconds());
+}
+
+void stop_study_timer() {
+  if (!study_timer_running) {
+    play_audio(10615);      // 当前还没有开始学习
+    return;
+  }
+
+  uint32_t total_seconds = get_study_elapsed_seconds();
+
+  // 先停止并复位，避免播报过程中继续累计。
+  study_timer_running = false;
+  study_start_ms = 0;
+
+  play_audio(10612);        // 学习已结束，本次学习时间
+  delay(180);
+  play_duration_seconds(total_seconds);
+}
+
+void send_env_query_to_k1() {
+  uint8_t packet[3] = {0xAB, CMD_ENV_REPORT, 0x55};
+  Serial.write(packet, 3);
+}
+
+void handle_k1_cmd(uint8_t rx_cmd) {
+  // K1 扩展协议：AA cmd 55，后面可能跟 0D 0A，状态机自动忽略。
+  delay(50);
+
+  if (rx_cmd == 0x01) {
+    play_good_variant();
+  }
+  else if (rx_cmd == 0x02) {
+    play_slouch_mild_variant();
+  }
+  else if (rx_cmd == 0x03) {
+    play_shoulder_mild_variant();
+  }
+  else if (rx_cmd == 0x04) {
+    play_slouch_severe_variant();
+  }
+  else if (rx_cmd == 0x05) {
+    play_shoulder_severe_variant();
+  }
+  else if (rx_cmd == 0x06) {
+    play_both_bad_variant();
+  }
+  else if (rx_cmd == 0x07) {
+    play_person_lost_variant();
+  }
+  else if (rx_cmd == CMD_ENV_FAIL) {
+    play_env_fail();
+  }
+}
+
+// ==================== 3. 使用 UART0 / TX0 RX0 接收 K1 指令 ====================
+void UART0_RX(){
+  uint8_t rx_state = 0;
+  uint8_t rx_cmd = 0;
+  uint8_t env_temp = 0;
+  uint8_t env_hum = 0;
+
+  while (1) {
+    while (Serial.available() > 0){
+      uint8_t data = Serial.read();
+
+      // 注意：这里不要 Serial.print 调试信息。
+      // Serial 现在就是 K1 通信串口，打印文字会干扰协议。
+
+      if (rx_state == 0) {
+        if (data == 0xAA) {
+          rx_state = 1;
+        }
+      }
+      else if (rx_state == 1) {
+        rx_cmd = data;
+        if (rx_cmd == CMD_ENV_REPORT) {
+          rx_state = 3;   // 环境包：AA 20 temp hum 55
+        } else {
+          rx_state = 2;   // 普通包：AA cmd 55
+        }
+      }
+      else if (rx_state == 2) {
+        if (data == 0x55) {
+          // 环境读取失败不受坐姿检测开关影响。
+          if (rx_cmd == CMD_ENV_FAIL) {
+            handle_k1_cmd(rx_cmd);
+          }
+          // 坐姿播报受开关控制。
+          else if (posture_detect_enable) {
+            handle_k1_cmd(rx_cmd);
+          }
+        }
+        rx_state = 0;
+      }
+      else if (rx_state == 3) {
+        env_temp = data;
+        rx_state = 4;
+      }
+      else if (rx_state == 4) {
+        env_hum = data;
+        rx_state = 5;
+      }
+      else if (rx_state == 5) {
+        if (data == 0x55) {
+          // 温湿度播报不受坐姿检测开关影响。
+          play_env_report(env_temp, env_hum);
+        }
+        rx_state = 0;
+      }
+    }
+    delay(2);
+  }
+
+  vTaskDelete(NULL);
+}
+
+// ==================== 4. 离线语音唤醒/命令词回调区 ====================
+void ASR_CODE(){
+  set_state_enter_wakeup(10000);
+
+  switch (snid) {
+    case 1:
+      posture_detect_enable = true;
+      break;
+
+    case 2:
+      posture_detect_enable = false;
+      break;
+
+    case 3:
+      if (posture_detect_enable) play_audio(10523);
+      else play_audio(10524);
+      break;
+
+    case 4:
+      // 语音命令：播报环境状态
+      // setup 里的 ASRTO 已经会说“正在为您查询环境数据”，这里仅向 K1 发请求。
+      send_env_query_to_k1();
+      break;
+
+    case 5:
+      // 语音命令：当前温湿度
+      send_env_query_to_k1();
+      break;
+
+    case 6:
+      // 语音命令：开始学习
+      start_study_timer();
+      break;
+
+    case 7:
+      // 语音命令：学多久了
+      report_study_time();
+      break;
+
+    case 8:
+      // 语音命令：停止学习
+      stop_study_timer();
+      break;
+  }
+}
+
+void app(){
+  while (1) {
+    delay(100);
+  }
+
+  vTaskDelete(NULL);
+}
+
+// ==================== 5. 硬件初始化 ====================
+void hardware_init(){
+  // 音量 0~10。比赛演示可适当调大。
+  vol_set(4);
+
+  // 使用 UART0，也就是 TX0/RX0。
+  // 波特率必须和 K1 main.cpp 中的 B9600 一致。
+  Serial.begin(9600);
+
+  xTaskCreate(UART0_RX, "UART0_RX", 512, NULL, 4, NULL);
+  xTaskCreate(app, "app", 128, NULL, 4, NULL);
+
+  vTaskDelete(NULL);
+}
+
+void setup()
+{
+  //{ID:0,keyword:"唤醒词",ASR:"小助手",ASRTO:"我在呢"}
+  //{ID:1,keyword:"命令词",ASR:"开始检测",ASRTO:"已打开坐姿检测"}
+  //{ID:2,keyword:"命令词",ASR:"关闭检测",ASRTO:"已关闭坐姿检测"}
+  //{ID:3,keyword:"命令词",ASR:"检测状态",ASRTO:"正在为您查询"}
+  //{ID:4,keyword:"命令词",ASR:"播报环境状态",ASRTO:"正在获取环境状态"}
+  //{ID:5,keyword:"命令词",ASR:"当前温湿度",ASRTO:"正在获取环境状态"}
+  //{ID:6,keyword:"命令词",ASR:"开始学习",ASRTO:""}
+  //{ID:7,keyword:"命令词",ASR:"学多久了",ASRTO:""}
+  //{ID:8,keyword:"命令词",ASR:"停止学习",ASRTO:""}
+
+  setPinFun(4, FIRST_FUNCTION);
+  pinMode(4, output);
+  digitalWrite(4, 0);
+}
+
+/** edittype="asr_procode" */

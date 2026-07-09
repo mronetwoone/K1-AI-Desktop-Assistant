@@ -1,0 +1,8 @@
+# K1 桌面伴学机器人串口权限规则
+# 使用方法：sudo cp 99-study-robot.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules
+#          sudo udevadm trigger
+
+KERNEL=="ttyS10", MODE="0666"
+KERNEL=="ttyACM[0-9]*", MODE="0666"
+KERNEL=="ttyUSB[0-9]*", MODE="0666"

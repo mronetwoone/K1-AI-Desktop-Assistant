@@ -1,0 +1,15 @@
+build/
+*.o
+*.so
+*.a
+*.bin
+*.elf
+*.map
+*.onnx
+*.pt
+*.engine
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
